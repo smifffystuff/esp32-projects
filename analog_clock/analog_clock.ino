@@ -51,23 +51,51 @@ const uint8_t START_SECOND = 0;
 Arduino_DataBus *bus = new Arduino_HWSPI(
     PIN_LCD_DC, PIN_LCD_CS, PIN_LCD_SCK, PIN_LCD_MOSI, PIN_LCD_MISO);
 
-// rotation 4 = MADCTL_MX only (horizontal mirror, no swap/vertical-flip) - this panel's
-// column addressing is mirrored relative to the driver's default (rotation 0) assumption.
+// rotation 7 = MADCTL_MV only (landscape, this panel's mirror quirk needs neither MX nor
+// MY set here - confirmed against the physical board; the portrait single-bit pattern
+// did not carry over once MV was involved). rotation 5 (MX+MY+MV) is its 180-flip pair.
 Arduino_GFX *gfx = new Arduino_ST7789(
-    bus, PIN_LCD_RST, 4 /* rotation */, false /* IPS */,
+    bus, PIN_LCD_RST, 7 /* rotation */, false /* IPS */,
     172 /* width */, 320 /* height */,
     34 /* col offset 1 */, 0 /* row offset 1 */,
     34 /* col offset 2 */, 0 /* row offset 2 */);
 
 // Off-screen framebuffer so the whole face+hands redraw each second without flicker.
-Arduino_Canvas *canvas = new Arduino_Canvas(172, 320, gfx);
+// Landscape dimensions (rotation swaps width/height from the panel's native portrait size).
+Arduino_Canvas *canvas = new Arduino_Canvas(320, 172, gfx);
 
-const int16_t CX = 86;
-const int16_t CY = 160;
-const int16_t RADIUS = 75;
+const int16_t CX = 160;
+const int16_t CY = 86;
+const int16_t RADIUS = 70;
 
 unsigned long startMillis;
 bool timeSynced = false;
+
+// Auto-rotation via the onboard QMI8658A IMU, landscape only (two 180-degree-apart
+// orientations). Gravity loads onto the X axis when held landscape: measured ~+990mg
+// for rotation 7, ~-987mg for rotation 5 (confirmed against the physical board).
+const float ORIENTATION_THRESHOLD_MG = 500.0;
+uint8_t currentRotation = 7;
+
+void updateOrientation() {
+  if (!imuReady) return;
+
+  float ax, ay, az;
+  if (!imu.readAccel(ax, ay, az)) return;
+
+  uint8_t desiredRotation = currentRotation;
+  if (ax > ORIENTATION_THRESHOLD_MG) {
+    desiredRotation = 7;
+  } else if (ax < -ORIENTATION_THRESHOLD_MG) {
+    desiredRotation = 5;
+  }
+  // else: near the dead zone (board lying flat) - keep the last known orientation.
+
+  if (desiredRotation != currentRotation) {
+    currentRotation = desiredRotation;
+    gfx->setRotation(currentRotation);
+  }
+}
 
 void showStatus(const char *line1, const char *line2 = nullptr) {
   canvas->fillScreen(RGB565_BLACK);
@@ -154,6 +182,8 @@ void setup() {
 }
 
 void loop() {
+  updateOrientation();
+
   uint8_t hh, mm, ss;
 
   if (timeSynced) {
@@ -175,16 +205,6 @@ void loop() {
   drawHand(mm * 6.0, RADIUS * 0.75, RGB565_WHITE);                // minute hand
   drawHand(ss * 6.0, RADIUS * 0.9, RGB565_RED);                   // second hand
   canvas->flush();
-
-  Serial.printf("tick %lu imuReady=%d\n", millis(), imuReady);
-  if (imuReady) {
-    float ax, ay, az;
-    if (imu.readAccel(ax, ay, az)) {
-      Serial.printf("AX=%.0f AY=%.0f AZ=%.0f\n", ax, ay, az);
-    } else {
-      Serial.println("readAccel failed");
-    }
-  }
 
   delay(1000);
 }
