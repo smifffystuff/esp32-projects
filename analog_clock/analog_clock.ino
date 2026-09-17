@@ -51,9 +51,13 @@ const uint8_t START_SECOND = 0;
 Arduino_DataBus *bus = new Arduino_HWSPI(
     PIN_LCD_DC, PIN_LCD_CS, PIN_LCD_SCK, PIN_LCD_MOSI, PIN_LCD_MISO);
 
-// rotation 7 = MADCTL_MV only (landscape, this panel's mirror quirk needs neither MX nor
-// MY set here - confirmed against the physical board; the portrait single-bit pattern
-// did not carry over once MV was involved). rotation 5 (MX+MY+MV) is its 180-flip pair.
+// Four MADCTL rotation values, all confirmed against the physical board (not derived
+// on paper - the theoretical single-bit pattern from portrait did not carry over to
+// landscape once MV was involved, so each was verified by flashing and looking):
+//   4 = MX only          -> portrait, cable at bottom
+//   6 = MY only          -> portrait, cable at top (180 flip of 4)
+//   7 = MV only          -> landscape
+//   5 = MX+MY+MV         -> landscape, 180 flip of 7
 Arduino_GFX *gfx = new Arduino_ST7789(
     bus, PIN_LCD_RST, 7 /* rotation */, false /* IPS */,
     172 /* width */, 320 /* height */,
@@ -61,21 +65,44 @@ Arduino_GFX *gfx = new Arduino_ST7789(
     34 /* col offset 2 */, 0 /* row offset 2 */);
 
 // Off-screen framebuffer so the whole face+hands redraw each second without flicker.
-// Landscape dimensions (rotation swaps width/height from the panel's native portrait size).
+// Recreated on the fly when crossing between portrait and landscape (see setLayout()).
 Arduino_Canvas *canvas = new Arduino_Canvas(320, 172, gfx);
 
-const int16_t CX = 160;
-const int16_t CY = 86;
-const int16_t RADIUS = 70;
+int16_t CX = 160;
+int16_t CY = 86;
+int16_t RADIUS = 70;
 
 unsigned long startMillis;
 bool timeSynced = false;
 
-// Auto-rotation via the onboard QMI8658A IMU, landscape only (two 180-degree-apart
-// orientations). Gravity loads onto the X axis when held landscape: measured ~+990mg
-// for rotation 7, ~-987mg for rotation 5 (confirmed against the physical board).
+// Auto-rotation via the onboard QMI8658A IMU, all 4 orientations. Gravity loads onto
+// whichever axis currently faces "up/down" on the panel; the other axis stays near
+// zero. Calibrated against the physical board:
+//   AY ~ -920mg -> rotation 4 (portrait)     AY ~ +1005mg -> rotation 6 (portrait)
+//   AX ~ +990mg  -> rotation 7 (landscape)    AX ~ -987mg  -> rotation 5 (landscape)
 const float ORIENTATION_THRESHOLD_MG = 500.0;
 uint8_t currentRotation = 7;
+
+bool isLandscapeRotation(uint8_t r) {
+  return r == 5 || r == 7;
+}
+
+// Resizes the canvas and re-centers the face when crossing between portrait/landscape.
+void setLayout(bool landscape) {
+  delete canvas;
+  if (landscape) {
+    canvas = new Arduino_Canvas(320, 172, gfx);
+    CX = 160;
+    CY = 86;
+    RADIUS = 70;
+  } else {
+    canvas = new Arduino_Canvas(172, 320, gfx);
+    CX = 86;
+    CY = 160;
+    RADIUS = 75;
+  }
+  canvas->begin();
+}
 
 void updateOrientation() {
   if (!imuReady) return;
@@ -84,16 +111,21 @@ void updateOrientation() {
   if (!imu.readAccel(ax, ay, az)) return;
 
   uint8_t desiredRotation = currentRotation;
-  if (ax > ORIENTATION_THRESHOLD_MG) {
-    desiredRotation = 7;
-  } else if (ax < -ORIENTATION_THRESHOLD_MG) {
-    desiredRotation = 5;
+  if (fabs(ax) > fabs(ay) && fabs(ax) > ORIENTATION_THRESHOLD_MG) {
+    desiredRotation = (ax > 0) ? 7 : 5;
+  } else if (fabs(ay) > fabs(ax) && fabs(ay) > ORIENTATION_THRESHOLD_MG) {
+    desiredRotation = (ay < 0) ? 4 : 6;
   }
   // else: near the dead zone (board lying flat) - keep the last known orientation.
 
   if (desiredRotation != currentRotation) {
+    bool wasLandscape = isLandscapeRotation(currentRotation);
+    bool willBeLandscape = isLandscapeRotation(desiredRotation);
     currentRotation = desiredRotation;
     gfx->setRotation(currentRotation);
+    if (wasLandscape != willBeLandscape) {
+      setLayout(willBeLandscape);
+    }
   }
 }
 
@@ -172,7 +204,8 @@ void setup() {
   digitalWrite(PIN_LCD_BL, HIGH);
 
   canvas->begin();
-  gfx->invertDisplay(true); // JD9853 needs this via the ST7789 driver for correct colors
+  // No invertDisplay() call needed: the ST7789 driver's own init sequence already
+  // leaves this panel in the correct (non-inverted) state, given ips=false above.
 
   initIMU();
 
